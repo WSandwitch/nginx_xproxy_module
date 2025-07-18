@@ -1,6 +1,6 @@
 #!/bin/bash
 
-NGX_VERSION="1.24.0"
+NGX_VERSION="1.28.0"
 
 wget https://nginx.org/download/nginx-$NGX_VERSION.tar.gz 
 tar xzvf nginx-$NGX_VERSION.tar.gz
