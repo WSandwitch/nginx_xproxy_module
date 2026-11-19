@@ -107,10 +107,6 @@ typedef struct {
     ngx_array_t                   *lengths;
     ngx_array_t                   *values;
     ngx_str_t url;
-    ngx_str_t host;
-    uint16_t port;
-    char ver;
-    unsigned no_port:1;
     unsigned used:1;
 } ngx_xproxy_socks_t;
 
@@ -192,6 +188,15 @@ typedef struct {
         void* write_event;
         void* read_event;
     } handlers;
+
+    ngx_str_t                      socks_url;
+    ngx_str_t                      socks_target;
+    in_port_t                      socks_target_port;
+
+    u_char                         socks_buf[262];
+    size_t                         socks_len;
+    size_t                         socks_need;
+
     unsigned                       head:1;
     unsigned                       internal_chunked:1;
     unsigned                       header_sent:1;
@@ -200,6 +205,8 @@ typedef struct {
 
 static ngx_int_t ngx_http_xproxy_eval(ngx_http_request_t *r,
     ngx_http_xproxy_ctx_t *ctx, ngx_http_xproxy_loc_conf_t *plcf);
+static ngx_int_t ngx_http_socks_send_connect(ngx_http_request_t *r,
+    ngx_http_upstream_t *u, ngx_http_xproxy_ctx_t *ctx);
 #if (NGX_HTTP_CACHE)
 static ngx_int_t ngx_http_xproxy_create_key(ngx_http_request_t *r);
 #endif
@@ -1003,18 +1010,68 @@ static ngx_conf_bitmask_t  ngx_http_xproxy_cookie_flags_masks[] = {
 };
 
 
+static ngx_int_t
+ngx_http_socks_send_connect(ngx_http_request_t *r, ngx_http_upstream_t *u,
+    ngx_http_xproxy_ctx_t *ctx)
+{
+    ngx_connection_t  *c;
+    u_char            *buf;
+    size_t             len;
+    ssize_t            n;
+
+    if (ctx->socks_target.len == 0 || ctx->socks_target.len > 0xFF) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "invalid SOCKS target host length");
+        return NGX_ERROR;
+    }
+
+    if (ctx->socks_target_port == 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "invalid SOCKS target port");
+        return NGX_ERROR;
+    }
+
+    c = u->peer.connection;
+    len = ctx->socks_target.len + 7;
+
+    buf = ngx_pnalloc(r->pool, len);
+    if (buf == NULL) {
+        return NGX_ERROR;
+    }
+
+    buf[0] = NGX_HTTP_SOCKS_VERSION;
+    buf[1] = NGX_HTTP_SOCKS_CMD_CONNECT;
+    buf[2] = NGX_HTTP_SOCKS_RESERVED;
+    buf[3] = NGX_HTTP_SOCKS_ADDR_DOMAIN_NAME;
+    buf[4] = (u_char) ctx->socks_target.len;
+    ngx_memcpy(buf + 5, ctx->socks_target.data, ctx->socks_target.len);
+    *(u_short *) (buf + len - 2) = htons(ctx->socks_target_port);
+
+    n = c->send(c, buf, len);
+
+    if (n == NGX_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "SOCKS connect request send failed");
+        return NGX_ERROR;
+    }
+
+    if (n != (ssize_t) len) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "SOCKS connect request partially sent");
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
 static void
 ngx_http_socks_upstream_write_handler(ngx_http_request_t *r,
     ngx_http_upstream_t *u)
 {
     ngx_connection_t      *c;
-    u_char                *buf;
-    ngx_uint_t             len, port;
     ngx_http_xproxy_ctx_t  *pctx;
 
-    ngx_http_xproxy_loc_conf_t   *plcf;
-    
-    plcf = ngx_http_get_module_loc_conf(r, ngx_http_xproxy_module);
     pctx = ngx_http_get_module_ctx(r, ngx_http_xproxy_module);
     c = u->peer.connection;
 
@@ -1028,47 +1085,10 @@ ngx_http_socks_upstream_write_handler(ngx_http_request_t *r,
 
     switch (pctx->state) {
 
-    case socks_auth:
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                       "http socks auth");
-        c->send(c, ngx_http_socks_handshake_msg,
-            sizeof(ngx_http_socks_handshake_msg));
-        pctx->state = socks_connecting;
-        break;
-
     case socks_connecting:
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                       "http socks empty write");
-        break;
-
     case socks_connected:
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                       "http socks connect");
-
-        if (!plcf->socks.host.len || plcf->socks.host.len > 0xFF) {
-            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                          "invalid target host");
-            ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
-            return;
-        }
-
-        port = ngx_atoi(pctx->vars.port.data, pctx->vars.port.len);
-
-        len = plcf->socks.host.len + 7;
-
-        buf = ngx_pnalloc(r->pool, len);
-
-        buf[0] = NGX_HTTP_SOCKS_VERSION;
-        buf[1] = NGX_HTTP_SOCKS_CMD_CONNECT;
-        buf[2] = NGX_HTTP_SOCKS_RESERVED;
-        buf[3] = NGX_HTTP_SOCKS_ADDR_DOMAIN_NAME;
-        buf[4] = (u_char) plcf->socks.host.len;
-        *(u_short*) (buf + len - 2) = ntohs(port);
-        ngx_memcpy(buf + 5, plcf->socks.host.data, plcf->socks.host.len);
-
-        c->send(c, buf, len);
-
-        ngx_pfree(r->pool, buf);
+                       "http socks handshake in progress");
         break;
 
     default:
@@ -1083,9 +1103,10 @@ ngx_http_socks_upstream_read_handler(ngx_http_request_t *r,
     ngx_http_upstream_t *u)
 {
     ngx_connection_t          *c;
-    u_char                    *buf;
-    ngx_uint_t                 len;
-    ngx_http_xproxy_ctx_t      *ctx;
+    ngx_http_xproxy_ctx_t     *ctx;
+    ssize_t                    n;
+    size_t                     need;
+    ngx_uint_t                 rep;
 
     c = u->peer.connection;
     ctx = ngx_http_get_module_ctx(r, ngx_http_xproxy_module);
@@ -1098,86 +1119,137 @@ ngx_http_socks_upstream_read_handler(ngx_http_request_t *r,
         return;
     }
 
-    switch (ctx->state) {
-    case socks_connecting:
-        buf = ngx_pnalloc(r->pool, 2);
-        c->recv(c, buf, 2);
+    for ( ;; ) {
 
-        if (buf[0] != NGX_HTTP_SOCKS_VERSION) {
-            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                          "invalid SOCKS protocol version %d", buf[0]);
-            ctx->finalize(r, u, NGX_HTTP_BAD_GATEWAY);
-            return;
-        }
+        if (ctx->socks_len < ctx->socks_need) {
+            n = c->recv(c, ctx->socks_buf + ctx->socks_len,
+                        ctx->socks_need - ctx->socks_len);
 
-        if (buf[1] != NGX_HTTP_SOCKS_AUTH_NO_AUTHENTICATION) {
-            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                          "SOCKS proxy requires authentication");
-            ctx->finalize(r, u, NGX_HTTP_BAD_GATEWAY);
-            return;
-        }
-
-        ctx->state = socks_connected;
-
-        ngx_pfree(r->pool, buf);
-        break;
-
-    case socks_connected:
-        buf = ngx_pnalloc(r->pool, 5);
-        c->recv(c, buf, 5);
-
-        printf("%d %d %d\n", buf[0], buf[1], buf[2]);
-        if (buf[0] != NGX_HTTP_SOCKS_VERSION || buf[1] ||
-                buf[2] != NGX_HTTP_SOCKS_RESERVED) {
-            printf("%d\n", buf[1]);
-            if (buf[1] > sizeof(ngx_http_socks_errors)) {
-                buf[1] = 0;
+            if (n == NGX_AGAIN) {
+                return;
             }
-            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                          "SOCKS error: %s", ngx_http_socks_errors[buf[1]]);
-            ctx->finalize(r, u, NGX_HTTP_BAD_GATEWAY);
-            return;
+
+            if (n == NGX_ERROR || n == 0) {
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                              "SOCKS handshake read failed");
+                ctx->finalize(r, u, NGX_HTTP_BAD_GATEWAY);
+                return;
+            }
+
+            ctx->socks_len += n;
+
+            if (ctx->socks_len < ctx->socks_need) {
+                return;
+            }
         }
-        
-        switch (buf[3]) {
 
-        case NGX_HTTP_SOCKS_ADDR_IPv4:
-            len = 6;
-            break;
+        if (ctx->state == socks_connecting) {
+            if (ctx->socks_buf[0] != NGX_HTTP_SOCKS_VERSION) {
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                              "invalid SOCKS protocol version %d",
+                              ctx->socks_buf[0]);
+                ctx->finalize(r, u, NGX_HTTP_BAD_GATEWAY);
+                return;
+            }
 
-        case NGX_HTTP_SOCKS_ADDR_IPv6:
-            len = 18;
-            break;
+            if (ctx->socks_buf[1] != NGX_HTTP_SOCKS_AUTH_NO_AUTHENTICATION) {
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                              "SOCKS proxy requires authentication");
+                ctx->finalize(r, u, NGX_HTTP_BAD_GATEWAY);
+                return;
+            }
 
-        case NGX_HTTP_SOCKS_ADDR_DOMAIN_NAME:
-            len = buf[4] + 2;
-            break;
+            if (ngx_http_socks_send_connect(r, u, ctx) != NGX_OK) {
+                ctx->finalize(r, u, NGX_HTTP_BAD_GATEWAY);
+                return;
+            }
 
-        default:
+            ctx->socks_len = 0;
+            ctx->socks_need = 4;
+            ctx->state = socks_connected;
+
+            continue;
+        }
+
+        if (ctx->state != socks_connected) {
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                           "http socks read default");
             ctx->next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
             return;
         }
 
-        ngx_pfree(r->pool, buf);
+        if (ctx->socks_need == 4) {
+            if (ctx->socks_buf[0] != NGX_HTTP_SOCKS_VERSION
+                || ctx->socks_buf[2] != NGX_HTTP_SOCKS_RESERVED)
+            {
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                              "invalid SOCKS reply");
+                ctx->finalize(r, u, NGX_HTTP_BAD_GATEWAY);
+                return;
+            }
 
-        buf = ngx_pnalloc(r->pool, len);
-        c->recv(c, buf, len);
-        ngx_pfree(r->pool, buf);
+            if (ctx->socks_buf[1] != 0) {
+                rep = ctx->socks_buf[1];
+
+                if (rep >= sizeof(ngx_http_socks_errors)
+                           / sizeof(ngx_http_socks_errors[0]))
+                {
+                    rep = 0;
+                }
+
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                              "SOCKS error: %s", ngx_http_socks_errors[rep]);
+                ctx->finalize(r, u, NGX_HTTP_BAD_GATEWAY);
+                return;
+            }
+
+            switch (ctx->socks_buf[3]) {
+
+            case NGX_HTTP_SOCKS_ADDR_IPv4:
+                ctx->socks_need = 10;
+                break;
+
+            case NGX_HTTP_SOCKS_ADDR_IPv6:
+                ctx->socks_need = 22;
+                break;
+
+            case NGX_HTTP_SOCKS_ADDR_DOMAIN_NAME:
+                ctx->socks_need = 5;
+                break;
+
+            default:
+                ctx->next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+                return;
+            }
+
+            continue;
+        }
+
+        if (ctx->socks_buf[3] == NGX_HTTP_SOCKS_ADDR_DOMAIN_NAME
+            && ctx->socks_need == 5)
+        {
+            need = 7 + ctx->socks_buf[4];
+
+            if (need > sizeof(ctx->socks_buf)) {
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                              "invalid SOCKS bound address length");
+                ctx->finalize(r, u, NGX_HTTP_BAD_GATEWAY);
+                return;
+            }
+
+            ctx->socks_need = need;
+            continue;
+        }
 
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
                        "http socks upstream connected");
 
         ctx->state = socks_done;
 
-        u->write_event_handler = ctx->handlers.write_event; //ngx_http_upstream_send_request_handler;
-        u->read_event_handler = ctx->handlers.read_event; //ngx_http_upstream_process_header;
+        u->write_event_handler = ctx->handlers.write_event;
+        u->read_event_handler = ctx->handlers.read_event;
 
-        break;
-
-    default:
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                       "http socks read default");
-        ctx->next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+        return;
     }
 }
 
@@ -1186,6 +1258,7 @@ static int
 after_connect_handler(ngx_http_request_t *r, ngx_http_upstream_t *u, void* next, void* finalize){
     ngx_http_xproxy_ctx_t      *ctx;
     ngx_connection_t          *c;
+    ssize_t                    n;
 
     c = u->peer.connection;
 
@@ -1209,12 +1282,25 @@ after_connect_handler(ngx_http_request_t *r, ngx_http_upstream_t *u, void* next,
     u->write_event_handler = ngx_http_socks_upstream_write_handler;
     u->read_event_handler = ngx_http_socks_upstream_read_handler;
 
-    c->send(c, ngx_http_socks_handshake_msg,
-        sizeof(ngx_http_socks_handshake_msg));
+    ctx->socks_len = 0;
+    ctx->socks_need = 2;
     ctx->state = socks_connecting;
 
-//    c->write.active = 0;
-//    c->write.ready = 0;
+    n = c->send(c, ngx_http_socks_handshake_msg,
+                sizeof(ngx_http_socks_handshake_msg));
+
+    if (n == NGX_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "SOCKS greeting send failed");
+        return NGX_ERROR;
+    }
+
+    if (n != (ssize_t) sizeof(ngx_http_socks_handshake_msg)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "SOCKS greeting partially sent");
+        return NGX_ERROR;
+    }
+
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
         return NGX_ERROR;
     }
@@ -1337,8 +1423,8 @@ ngx_http_xproxy_eval(ngx_http_request_t *r, ngx_http_xproxy_ctx_t *ctx,
     u_char               *p;
     size_t                add;
     u_short               port;
-    ngx_str_t             xproxy;
-    ngx_url_t             url;
+    ngx_str_t             xproxy, socks;
+    ngx_url_t             url, surl;
     ngx_http_upstream_t  *u;
 
     if (ngx_http_script_run(r, &xproxy, plcf->xproxy_lengths->elts, 0,
@@ -1416,66 +1502,85 @@ ngx_http_xproxy_eval(ngx_http_request_t *r, ngx_http_xproxy_ctx_t *ctx,
     if (u->resolved == NULL) {
         return NGX_ERROR;
     }
-    
-    //set proxy host as current host
-    if (plcf->socks.used){
-        ngx_str_t             socks;
-        if (plcf->socks.lengths){ //compile vars from xproxy_socks
+
+    if (plcf->socks.used) {
+
+        if (plcf->socks.lengths) {
             if (ngx_http_script_run(r, &socks, plcf->socks.lengths->elts, 0,
-                                plcf->socks.values->elts)
-                == NULL){
+                                    plcf->socks.values->elts)
+                == NULL)
+            {
                 return NGX_ERROR;
             }
-            plcf->socks.url = socks;
 
-            if (ngx_strncasecmp(socks.data, (u_char *) "socks4://", 9) == 0) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "only sock5 permitted");
-                return NGX_ERROR;
-                plcf->socks.ver=4;
-            } else if (ngx_strncasecmp(socks.data, (u_char *) "socks5://", 9) == 0) {
-                plcf->socks.ver=5;
-            } else {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "only sock5 permitted");
-                return NGX_ERROR;
-            }
+        } else {
+            socks = plcf->socks.url;
         }
 
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "set socks url to upstream");
-        //copy from pass to socks 
-        u_char * pos = (u_char*)strchr((void*)url.host.data, '/');
-        uint32_t len=pos?(pos-url.host.data):(uint32_t)strlen((void*)url.host.data);
-        if (!plcf->socks.host.data){
- //           plcf->socks.host.data=ngx_calloc(r->pool, len+1);
-            plcf->socks.host.data=ngx_calloc(len+1, r->connection->log);
+        if (socks.len <= 9
+            || ngx_strncasecmp(socks.data, (u_char *) "socks5://", 9) != 0)
+        {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "only socks5 permitted in \"%V\"", &socks);
+            return NGX_ERROR;
         }
-        strncpy((void*)plcf->socks.host.data, (void*)url.host.data, len);
-        plcf->socks.host.len=len;
-        
-        //if (pos){
-        //    plcf->socks.host.len = pos-plcf->socks.host.data;
-        //    *pos=0;
-        //}
-        plcf->socks.port = (in_port_t) (url.no_port ? port : url.port);
-        plcf->socks.no_port = url.no_port;
 
-        ngx_memzero(&url, sizeof(ngx_url_t));
+        if (url.host.len == 0 || url.host.len > 0xFF) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "invalid SOCKS target host");
+            return NGX_ERROR;
+        }
 
-        url.url.len = plcf->socks.url.len - 9;
-        url.url.data = plcf->socks.url.data + 9;
-        url.default_port = port;
-        url.uri_part = 1;
-        url.no_resolve = 1;
+        p = ngx_pnalloc(r->pool, url.host.len);
+        if (p == NULL) {
+            return NGX_ERROR;
+        }
 
-        if (ngx_parse_url(r->pool, &url) != NGX_OK) {
-            if (url.err) {
+        ngx_memcpy(p, url.host.data, url.host.len);
+        ctx->socks_target.len = url.host.len;
+        ctx->socks_target.data = p;
+
+        ctx->socks_target_port = (in_port_t) (url.no_port ? port : url.port);
+        if (ctx->socks_target_port == 0) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "invalid SOCKS target port");
+            return NGX_ERROR;
+        }
+
+        ctx->socks_url = socks;
+
+        ngx_memzero(&surl, sizeof(ngx_url_t));
+
+        surl.url.len = socks.len - 9;
+        surl.url.data = socks.data + 9;
+        surl.default_port = 1080;
+        surl.uri_part = 1;
+        surl.no_resolve = 1;
+
+        if (ngx_parse_url(r->pool, &surl) != NGX_OK) {
+            if (surl.err) {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                            "%s in socks upstream \"%V\"", url.err, &url.url);
+                              "%s in socks upstream \"%V\"", surl.err,
+                              &surl.url);
             }
 
             return NGX_ERROR;
         }
+
+        if (surl.addrs) {
+            u->resolved->sockaddr = surl.addrs[0].sockaddr;
+            u->resolved->socklen = surl.addrs[0].socklen;
+            u->resolved->name = surl.addrs[0].name;
+            u->resolved->naddrs = 1;
+        }
+
+        u->resolved->host = surl.host;
+        u->resolved->port = (in_port_t) (surl.no_port ? 1080 : surl.port);
+        u->resolved->no_port = surl.no_port;
+
         u->after_connect_handler = after_connect_handler;
+
+        return NGX_OK;
     }
 
     if (url.addrs) {
@@ -4229,9 +4334,8 @@ ngx_http_xproxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 #endif
     }
 
-    if (prev->socks.used){
+    if (!conf->socks.used && prev->socks.used) {
         conf->socks = prev->socks;
-        conf->socks.host.data=0;
     }
 
     if (clcf->lmt_excpt && clcf->handler == NULL
@@ -4534,17 +4638,17 @@ ngx_http_xproxy_socks(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_OK;
     }
 
-    if (ngx_strncasecmp(url->data, (u_char *) "socks4://", 9) == 0) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "only sock5 permitted");
-        return NGX_CONF_ERROR;
-        plcf->socks.ver=4;
-    } else if (ngx_strncasecmp(url->data, (u_char *) "socks5://", 9) == 0) {
-        plcf->socks.ver=5;
-    } else {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "only sock5 permitted");
+    if (url->len <= 9) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid socks URL \"%V\"", url);
         return NGX_CONF_ERROR;
     }
-  
+
+    if (ngx_strncasecmp(url->data, (u_char *) "socks5://", 9) != 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "only socks5 permitted");
+        return NGX_CONF_ERROR;
+    }
+
     plcf->socks.url = *url;
 
     return NGX_CONF_OK;
