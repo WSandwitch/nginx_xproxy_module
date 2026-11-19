@@ -1038,6 +1038,7 @@ ngx_http_socks_send_connect(ngx_http_request_t *r, ngx_http_upstream_t *u,
     u_char            *buf;
     size_t             len;
     ssize_t            n;
+    u_short            port;
 
     if (ctx->socks_target.len == 0 || ctx->socks_target.len > 0xFF) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -1065,7 +1066,8 @@ ngx_http_socks_send_connect(ngx_http_request_t *r, ngx_http_upstream_t *u,
     buf[3] = NGX_HTTP_SOCKS_ADDR_DOMAIN_NAME;
     buf[4] = (u_char) ctx->socks_target.len;
     ngx_memcpy(buf + 5, ctx->socks_target.data, ctx->socks_target.len);
-    *(u_short *) (buf + len - 2) = htons(ctx->socks_target_port);
+    port = htons(ctx->socks_target_port);
+    ngx_memcpy(buf + len - 2, &port, 2);
 
     n = c->send(c, buf, len);
 
