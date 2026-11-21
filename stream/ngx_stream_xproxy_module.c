@@ -9,6 +9,8 @@
 #include <ngx_core.h>
 #include <ngx_stream.h>
 
+#include "../common/ngx_xproxy_socks.h"
+
 
 typedef struct {
     ngx_addr_t                      *addr;
@@ -17,6 +19,13 @@ typedef struct {
     ngx_uint_t                       transparent; /* unsigned  transparent:1; */
 #endif
 } ngx_stream_upstream_local_t;
+
+
+typedef struct {
+    ngx_xproxy_socks_conn_t           socks;
+    ngx_str_t                         target_host;
+    in_port_t                         target_port;
+} ngx_stream_xproxy_ctx_t;
 
 
 typedef struct {
@@ -57,6 +66,15 @@ typedef struct {
 
     ngx_stream_upstream_srv_conf_t  *upstream;
     ngx_stream_complex_value_t      *upstream_value;
+
+    ngx_str_t                         target_host;
+    in_port_t                         target_port;
+
+    ngx_str_t                         socks_url;
+    ngx_stream_complex_value_t       *socks_value;
+    ngx_uint_t                        socks_resolve;
+
+    unsigned                          socks_used:1;
 } ngx_stream_xproxy_srv_conf_t;
 
 
@@ -86,7 +104,14 @@ static u_char *ngx_stream_xproxy_log_error(ngx_log_t *log, u_char *buf,
 static void *ngx_stream_xproxy_create_srv_conf(ngx_conf_t *cf);
 static char *ngx_stream_xproxy_merge_srv_conf(ngx_conf_t *cf, void *parent,
     void *child);
-static char *ngx_stream_xproxy_via(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_stream_xproxy_socks_init(ngx_stream_session_t *s);
+static void ngx_stream_xproxy_socks_handshake(ngx_stream_session_t *s);
+static void ngx_stream_xproxy_socks_fail(ngx_stream_session_t *s,
+    ngx_uint_t ft);
+static void ngx_stream_xproxy_socks_write_handler(ngx_event_t *ev);
+static void ngx_stream_xproxy_socks_read_handler(ngx_event_t *ev);
+static char *ngx_stream_xproxy_socks(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static char *ngx_stream_xproxy_pass(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_stream_xproxy_bind(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -135,14 +160,35 @@ static ngx_conf_deprecated_t  ngx_conf_deprecated_xproxy_upstream_buffer = {
 };
 
 
+static ngx_conf_enum_t  ngx_stream_xproxy_socks_resolve[] = {
+    { ngx_string("proxy"), NGX_XPROXY_SOCKS_RESOLVE_PROXY },
+    { ngx_string("local"), NGX_XPROXY_SOCKS_RESOLVE_LOCAL },
+    { ngx_null_string, 0 }
+};
+
+
 static ngx_command_t  ngx_stream_xproxy_commands[] = {
 
-    { ngx_string("xproxy_via"),
+    { ngx_string("xproxy_socks"),
       NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
-      ngx_stream_xproxy_via,
+      ngx_stream_xproxy_socks,
       NGX_STREAM_SRV_CONF_OFFSET,
       0,
       NULL },
+
+    { ngx_string("xproxy_via"),
+      NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_stream_xproxy_socks,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("xproxy_socks_resolve"),
+      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xproxy_srv_conf_t, socks_resolve),
+      &ngx_stream_xproxy_socks_resolve },
 
     { ngx_string("xproxy_pass"),
       NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
@@ -397,6 +443,344 @@ ngx_module_t  ngx_stream_xproxy_module = {
 };
 
 
+static ngx_int_t
+ngx_stream_xproxy_socks_init(ngx_stream_session_t *s)
+{
+    ngx_str_t                        host, socks;
+    ngx_url_t                        url;
+    ngx_addr_t                       addr;
+    ngx_int_t                        rc;
+    ngx_connection_t                *c;
+    ngx_resolver_ctx_t              *rctx, temp;
+    ngx_stream_upstream_t           *u;
+    ngx_stream_core_srv_conf_t      *cscf;
+    ngx_stream_xproxy_ctx_t         *xctx;
+    ngx_stream_xproxy_srv_conf_t    *pscf;
+    ngx_stream_upstream_resolved_t  *ur;
+
+    c = s->connection;
+    u = s->upstream;
+    pscf = ngx_stream_get_module_srv_conf(s, ngx_stream_xproxy_module);
+    xctx = ngx_stream_get_module_ctx(s, ngx_stream_xproxy_module);
+
+    if (pscf->upstream_value) {
+
+        if (ngx_stream_complex_value(s, pscf->upstream_value, &host)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        ngx_memzero(&url, sizeof(ngx_url_t));
+
+        url.url = host;
+        url.no_resolve = 1;
+
+        if (ngx_parse_url(c->pool, &url) != NGX_OK) {
+            if (url.err) {
+                ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                              "%s in upstream \"%V\"", url.err, &url.url);
+            }
+
+            return NGX_ERROR;
+        }
+
+        if (url.host.len == 0 || url.no_port || url.port == 0) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "no port in upstream \"%V\"", &host);
+            return NGX_ERROR;
+        }
+
+        xctx->target_host = url.host;
+        xctx->target_port = url.port;
+
+    } else {
+        if (pscf->target_host.len == 0 || pscf->target_port == 0) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "socks requires \"xproxy_pass host:port\"");
+            return NGX_ERROR;
+        }
+
+        xctx->target_host = pscf->target_host;
+        xctx->target_port = pscf->target_port;
+    }
+
+    if (pscf->socks_value) {
+        if (ngx_stream_complex_value(s, pscf->socks_value, &socks)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+    } else {
+        socks = pscf->socks_url;
+    }
+
+    if (ngx_xproxy_socks_init(&xctx->socks, c->pool, &socks,
+                              pscf->socks_resolve, &xctx->target_host,
+                              xctx->target_port, &host)
+        != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "invalid socks configuration: %V", &host);
+        return NGX_ERROR;
+    }
+
+#if (NGX_STREAM_SSL)
+    u->ssl_name = xctx->target_host;
+#endif
+
+    ur = ngx_pcalloc(c->pool, sizeof(ngx_stream_upstream_resolved_t));
+    if (ur == NULL) {
+        return NGX_ERROR;
+    }
+
+    u->resolved = ur;
+
+    ur->host = xctx->socks.proxy_host;
+    ur->port = xctx->socks.proxy_port;
+    ur->no_port = 0;
+
+    ngx_memzero(&addr, sizeof(ngx_addr_t));
+
+    rc = ngx_parse_addr(c->pool, &addr, xctx->socks.proxy_host.data,
+                        xctx->socks.proxy_host.len);
+
+    if (rc == NGX_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "invalid socks proxy address");
+        return NGX_ERROR;
+    }
+
+    if (rc == NGX_OK) {
+        if (addr.sockaddr->sa_family == AF_INET) {
+            ((struct sockaddr_in *) addr.sockaddr)->sin_port =
+                htons(xctx->socks.proxy_port);
+
+#if (NGX_HAVE_INET6)
+        } else if (addr.sockaddr->sa_family == AF_INET6) {
+            ((struct sockaddr_in6 *) addr.sockaddr)->sin6_port =
+                htons(xctx->socks.proxy_port);
+#endif
+        }
+
+        ur->sockaddr = addr.sockaddr;
+        ur->socklen = addr.socklen;
+        ur->name = xctx->socks.proxy_host;
+        ur->naddrs = 1;
+
+        if (ngx_stream_upstream_create_round_robin_peer(s, ur) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        u->peer.start_time = ngx_current_msec;
+
+        if (pscf->next_upstream_tries
+            && u->peer.tries > pscf->next_upstream_tries)
+        {
+            u->peer.tries = pscf->next_upstream_tries;
+        }
+
+        ngx_stream_xproxy_connect(s);
+
+        return NGX_OK;
+    }
+
+    temp.name = xctx->socks.proxy_host;
+
+    cscf = ngx_stream_get_module_srv_conf(s, ngx_stream_core_module);
+
+    rctx = ngx_resolve_start(cscf->resolver, &temp);
+    if (rctx == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (rctx == NGX_NO_RESOLVER) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "no resolver defined to resolve socks proxy %V",
+                      &xctx->socks.proxy_host);
+        return NGX_ERROR;
+    }
+
+    rctx->name = xctx->socks.proxy_host;
+    rctx->handler = ngx_stream_xproxy_resolve_handler;
+    rctx->data = s;
+    rctx->timeout = cscf->resolver_timeout;
+
+    ur->ctx = rctx;
+
+    if (ngx_resolve_name(rctx) != NGX_OK) {
+        ur->ctx = NULL;
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_stream_xproxy_socks_fail(ngx_stream_session_t *s, ngx_uint_t ft)
+{
+    ngx_connection_t          *c;
+    ngx_stream_upstream_t     *u;
+    ngx_stream_xproxy_ctx_t   *xctx;
+    ngx_str_t                  error;
+
+    (void) ft;
+
+    c = s->connection;
+    u = s->upstream;
+    xctx = ngx_stream_get_module_ctx(s, ngx_stream_xproxy_module);
+
+    if (u && u->peer.connection) {
+        ngx_del_timer(u->peer.connection->read);
+        ngx_del_timer(u->peer.connection->write);
+    }
+
+    if (xctx && xctx->socks.error.len) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "socks handshake failed: %V", &xctx->socks.error);
+    }
+
+    if (xctx) {
+        (void) ngx_xproxy_socks_reset(&xctx->socks, c->pool, &error);
+    }
+
+    ngx_stream_xproxy_next_upstream(s);
+}
+
+
+static void
+ngx_stream_xproxy_socks_write_handler(ngx_event_t *ev)
+{
+    ngx_connection_t          *c;
+    ngx_stream_session_t      *s;
+    ngx_stream_xproxy_ctx_t   *xctx;
+
+    c = ev->data;
+    s = c->data;
+    xctx = ngx_stream_get_module_ctx(s, ngx_stream_xproxy_module);
+
+    if (ev->timedout) {
+        ngx_stream_xproxy_socks_fail(s, 0);
+        return;
+    }
+
+    if (ngx_xproxy_socks_send(&xctx->socks, c) == NGX_ERROR) {
+        ngx_stream_xproxy_socks_fail(s, 0);
+        return;
+    }
+
+    if (xctx->socks.out_len == 0) {
+        if (c->write->timer_set) { ngx_del_timer(c->write); }
+    }
+}
+
+
+static void
+ngx_stream_xproxy_socks_read_handler(ngx_event_t *ev)
+{
+    ngx_connection_t          *c;
+    ngx_stream_session_t      *s;
+    ngx_stream_xproxy_ctx_t   *xctx;
+    ngx_int_t                  rc;
+    ngx_str_t                  error;
+
+    c = ev->data;
+    s = c->data;
+    xctx = ngx_stream_get_module_ctx(s, ngx_stream_xproxy_module);
+
+    if (ev->timedout) {
+        ngx_stream_xproxy_socks_fail(s, 0);
+        return;
+    }
+
+    for ( ;; ) {
+
+        rc = ngx_xproxy_socks_recv(&xctx->socks, c, c->pool, &error);
+
+        if (rc == NGX_ERROR) {
+            ngx_stream_xproxy_socks_fail(s, 0);
+            return;
+        }
+
+        if (rc == NGX_OK) {
+            if (c->read->timer_set) { ngx_del_timer(c->read); }
+            if (c->write->timer_set) { ngx_del_timer(c->write); }
+
+            ngx_stream_xproxy_init_upstream(s);
+            return;
+        }
+
+        if (xctx->socks.out_len) {
+            if (ngx_xproxy_socks_send(&xctx->socks, c) == NGX_ERROR) {
+                ngx_stream_xproxy_socks_fail(s, 0);
+                return;
+            }
+
+            if (xctx->socks.out_len) {
+                return;
+            }
+
+            if (c->write->timer_set) { ngx_del_timer(c->write); }
+            continue;
+        }
+
+        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+            ngx_stream_xproxy_socks_fail(s, 0);
+            return;
+        }
+
+        if (!c->read->timer_set) {
+            ngx_stream_xproxy_srv_conf_t  *pscf;
+
+            pscf = ngx_stream_get_module_srv_conf(s, ngx_stream_xproxy_module);
+            ngx_add_timer(c->read, pscf->connect_timeout);
+        }
+
+        return;
+    }
+}
+
+
+static void
+ngx_stream_xproxy_socks_handshake(ngx_stream_session_t *s)
+{
+    ngx_stream_upstream_t     *u;
+    ngx_stream_xproxy_ctx_t   *xctx;
+    ngx_stream_xproxy_srv_conf_t  *pscf;
+
+    u = s->upstream;
+    pscf = ngx_stream_get_module_srv_conf(s, ngx_stream_xproxy_module);
+    xctx = ngx_stream_get_module_ctx(s, ngx_stream_xproxy_module);
+
+    if (xctx->socks.state == NGX_XPROXY_SOCKS_STATE_DONE) {
+        ngx_stream_xproxy_init_upstream(s);
+        return;
+    }
+
+    u->peer.connection->read->handler = ngx_stream_xproxy_socks_read_handler;
+    u->peer.connection->write->handler = ngx_stream_xproxy_socks_write_handler;
+
+    if (ngx_xproxy_socks_send(&xctx->socks, u->peer.connection)
+        == NGX_ERROR)
+    {
+        ngx_stream_xproxy_socks_fail(s, 0);
+        return;
+    }
+
+    if (!u->peer.connection->read->timer_set) {
+        ngx_add_timer(u->peer.connection->read, pscf->connect_timeout);
+    }
+
+    if (xctx->socks.out_len
+        && !u->peer.connection->write->timer_set)
+    {
+        ngx_add_timer(u->peer.connection->write, pscf->connect_timeout);
+    }
+}
+
+
 static void
 ngx_stream_xproxy_handler(ngx_stream_session_t *s)
 {
@@ -406,6 +790,7 @@ ngx_stream_xproxy_handler(ngx_stream_session_t *s)
     ngx_connection_t                 *c;
     ngx_resolver_ctx_t               *ctx, temp;
     ngx_stream_upstream_t            *u;
+    ngx_stream_xproxy_ctx_t          *xctx;
     ngx_stream_core_srv_conf_t       *cscf;
     ngx_stream_xproxy_srv_conf_t      *pscf;
     ngx_stream_upstream_srv_conf_t   *uscf, **uscfp;
@@ -425,6 +810,14 @@ ngx_stream_xproxy_handler(ngx_stream_session_t *s)
     }
 
     s->upstream = u;
+
+    xctx = ngx_pcalloc(c->pool, sizeof(ngx_stream_xproxy_ctx_t));
+    if (xctx == NULL) {
+        ngx_stream_xproxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    ngx_stream_set_ctx(s, xctx, ngx_stream_xproxy_module);
 
     s->log_handler = ngx_stream_xproxy_log_error;
 
@@ -468,6 +861,14 @@ ngx_stream_xproxy_handler(ngx_stream_session_t *s)
 
     if (c->read->ready) {
         ngx_post_event(c->read, &ngx_posted_events);
+    }
+
+    if (pscf->socks_used) {
+        if (ngx_stream_xproxy_socks_init(s) != NGX_OK) {
+            ngx_stream_xproxy_finalize(s, NGX_STREAM_BAD_GATEWAY);
+        }
+
+        return;
     }
 
     if (pscf->upstream_value) {
@@ -962,8 +1363,8 @@ ngx_stream_xproxy_send_xproxy_protocol(ngx_stream_session_t *s)
     ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "stream xproxy send XPROXY protocol header");
 
-    p = ngx_xproxy_protocol_write(c, buf,
-                                 buf + NGX_PROXY_PROTOCOL_V1_MAX_HEADER);
+    p = ngx_proxy_protocol_write(c, buf,
+                                   buf + NGX_PROXY_PROTOCOL_V1_MAX_HEADER);
     if (p == NULL) {
         ngx_stream_xproxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
         return NGX_ERROR;
@@ -1313,9 +1714,15 @@ ngx_stream_xproxy_ssl_certificate(ngx_stream_session_t *s)
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "stream upstream ssl key: \"%s\"", key.data);
 
+#if (nginx_version >= 1030000)
+    if (ngx_ssl_connection_certificate(c, c->pool, &cert, &key, NULL,
+                                       pscf->ssl_passwords)
+        != NGX_OK)
+#else
     if (ngx_ssl_connection_certificate(c, c->pool, &cert, &key,
                                        pscf->ssl_passwords)
         != NGX_OK)
+#endif
     {
         return NGX_ERROR;
     }
@@ -1522,8 +1929,9 @@ ngx_stream_xproxy_process_connection(ngx_event_t *ev, ngx_uint_t from_upstream)
 static void
 ngx_stream_xproxy_connect_handler(ngx_event_t *ev)
 {
-    ngx_connection_t      *c;
-    ngx_stream_session_t  *s;
+    ngx_connection_t               *c;
+    ngx_stream_session_t           *s;
+    ngx_stream_xproxy_srv_conf_t   *pscf;
 
     c = ev->data;
     s = c->data;
@@ -1534,13 +1942,20 @@ ngx_stream_xproxy_connect_handler(ngx_event_t *ev)
         return;
     }
 
-    ngx_del_timer(c->write);
+    if (c->write->timer_set) { ngx_del_timer(c->write); }
 
     ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "stream xproxy connect upstream");
 
     if (ngx_stream_xproxy_test_connect(c) != NGX_OK) {
         ngx_stream_xproxy_next_upstream(s);
+        return;
+    }
+
+    pscf = ngx_stream_get_module_srv_conf(s, ngx_stream_xproxy_module);
+
+    if (pscf->socks_used) {
+        ngx_stream_xproxy_socks_handshake(s);
         return;
     }
 
@@ -1803,7 +2218,7 @@ ngx_stream_xproxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
             ngx_add_timer(c->write, pscf->timeout);
 
         } else if (c->write->timer_set) {
-            ngx_del_timer(c->write);
+            if (c->write->timer_set) { ngx_del_timer(c->write); }
         }
     }
 }
@@ -1959,6 +2374,18 @@ ngx_stream_xproxy_next_upstream(ngx_stream_session_t *s)
         u->peer.connection = NULL;
     }
 
+    if (pscf->socks_used) {
+        ngx_str_t   error;
+        ngx_stream_xproxy_ctx_t  *xctx;
+
+        xctx = ngx_stream_get_module_ctx(s, ngx_stream_xproxy_module);
+
+        if (xctx) {
+            (void) ngx_xproxy_socks_reset(&xctx->socks, s->connection->pool,
+                                          &error);
+        }
+    }
+
     ngx_stream_xproxy_connect(s);
 }
 
@@ -2099,6 +2526,7 @@ ngx_stream_xproxy_create_srv_conf(ngx_conf_t *cf)
     conf->local = NGX_CONF_UNSET_PTR;
     conf->socket_keepalive = NGX_CONF_UNSET;
     conf->half_close = NGX_CONF_UNSET;
+    conf->socks_resolve = NGX_CONF_UNSET_UINT;
 
 #if (NGX_STREAM_SSL)
     conf->ssl_enable = NGX_CONF_UNSET;
@@ -2158,6 +2586,21 @@ ngx_stream_xproxy_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
                               prev->socket_keepalive, 0);
 
     ngx_conf_merge_value(conf->half_close, prev->half_close, 0);
+
+    if (!conf->socks_used && prev->socks_used) {
+        conf->socks_used = prev->socks_used;
+        conf->socks_url = prev->socks_url;
+        conf->socks_value = prev->socks_value;
+    }
+
+    ngx_conf_merge_uint_value(conf->socks_resolve,
+                              prev->socks_resolve,
+                              NGX_XPROXY_SOCKS_RESOLVE_PROXY);
+
+    if (conf->target_host.len == 0) {
+        conf->target_host = prev->target_host;
+        conf->target_port = prev->target_port;
+    }
 
 #if (NGX_STREAM_SSL)
 
@@ -2359,7 +2802,61 @@ ngx_stream_xproxy_set_ssl(ngx_conf_t *cf, ngx_stream_xproxy_srv_conf_t *pscf)
 #endif
 
 static char *
-ngx_stream_xproxy_via(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
+ngx_stream_xproxy_socks(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_stream_xproxy_srv_conf_t *pscf = conf;
+
+    ngx_str_t                            *value, *url;
+    ngx_uint_t                            n;
+    ngx_str_t                             error;
+    ngx_stream_complex_value_t            cv;
+    ngx_stream_compile_complex_value_t    ccv;
+
+    if (pscf->socks_used || pscf->socks_value) {
+        return "is duplicate";
+    }
+
+    if (pscf->upstream || pscf->upstream_value) {
+        return "must be before xproxy_pass";
+    }
+
+    value = cf->args->elts;
+    url = &value[1];
+
+    pscf->socks_used = 1;
+
+    n = ngx_stream_script_variables_count(url);
+
+    if (n) {
+        ngx_memzero(&ccv, sizeof(ngx_stream_compile_complex_value_t));
+
+        ccv.cf = cf;
+        ccv.value = url;
+        ccv.complex_value = &cv;
+
+        if (ngx_stream_compile_complex_value(&ccv) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+
+        pscf->socks_value = ngx_palloc(cf->pool,
+                                       sizeof(ngx_stream_complex_value_t));
+        if (pscf->socks_value == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        *pscf->socks_value = cv;
+
+        return NGX_CONF_OK;
+    }
+
+    if (ngx_xproxy_socks_check_url(cf->pool, url, &error) != NGX_OK) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid socks URL \"%V\": %V", url, &error);
+        return NGX_CONF_ERROR;
+    }
+
+    pscf->socks_url = *url;
+
     return NGX_CONF_OK;
 }
 
@@ -2413,10 +2910,36 @@ ngx_stream_xproxy_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     u.url = *url;
     u.no_resolve = 1;
 
+    if (pscf->socks_used) {
+
+        if (ngx_parse_url(cf->pool, &u) != NGX_OK) {
+            if (u.err) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "%s in upstream \"%V\"", u.err, &u.url);
+            }
+
+            return NGX_CONF_ERROR;
+        }
+
+        if (u.no_port || u.port == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "no port in upstream \"%V\"", url);
+            return NGX_CONF_ERROR;
+        }
+
+        pscf->target_host = u.host;
+        pscf->target_port = u.port;
+
+        return NGX_CONF_OK;
+    }
+
     pscf->upstream = ngx_stream_upstream_add(cf, &u, 0);
     if (pscf->upstream == NULL) {
         return NGX_CONF_ERROR;
     }
+
+    pscf->target_host = u.host;
+    pscf->target_port = u.no_port ? 0 : u.port;
 
     return NGX_CONF_OK;
 }
