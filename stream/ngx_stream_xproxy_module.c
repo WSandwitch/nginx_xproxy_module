@@ -633,8 +633,13 @@ ngx_stream_xproxy_socks_fail(ngx_stream_session_t *s, ngx_uint_t ft)
     xctx = ngx_stream_get_module_ctx(s, ngx_stream_xproxy_module);
 
     if (u && u->peer.connection) {
-        ngx_del_timer(u->peer.connection->read);
-        ngx_del_timer(u->peer.connection->write);
+        if (u->peer.connection->read->timer_set) {
+            ngx_del_timer(u->peer.connection->read);
+        }
+
+        if (u->peer.connection->write->timer_set) {
+            ngx_del_timer(u->peer.connection->write);
+        }
     }
 
     if (xctx && xctx->socks.error.len) {
