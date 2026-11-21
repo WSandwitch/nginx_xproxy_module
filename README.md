@@ -97,7 +97,9 @@ Upstream keepalive is disabled when SOCKS is active, because a SOCKS connection 
 
 ## Stream
 
-Only TCP is supported with SOCKS.
+The stream module is a fork of `ngx_stream_proxy_module` with SOCKS4/SOCKS5 support. It proxies TCP connections through a SOCKS proxy and supports the inherited stream proxy features, including `xproxy_ssl`, `xproxy_protocol`, timeouts and buffering.
+
+Sample TCP proxy over an authenticated SOCKS5 proxy:
 
 ```nginx
 stream {
@@ -106,6 +108,20 @@ stream {
 
         xproxy_socks socks5://user:password@proxy:1080;
         xproxy_socks_resolve proxy;
+        xproxy_pass backend.internal:5432;
+    }
+}
+```
+
+Sample TLS proxy through a local Tor daemon:
+
+```nginx
+stream {
+    server {
+        listen 127.0.0.1:8443;
+
+        xproxy_socks socks5://127.0.0.1:9050;
+        xproxy_socks_resolve proxy;
         xproxy_pass target.example:443;
 
         xproxy_ssl on;
@@ -113,6 +129,8 @@ stream {
     }
 }
 ```
+
+Only TCP is supported with SOCKS.
 
 `xproxy_pass` must use an explicit `host:port`. Named upstreams are not supported together with SOCKS, because the SOCKS target would be ambiguous.
 
