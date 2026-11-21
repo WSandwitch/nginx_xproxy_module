@@ -97,7 +97,7 @@ Upstream keepalive is disabled when SOCKS is active, because a SOCKS connection 
 
 ## Stream
 
-Only TCP is supported with SOCKS. UDP sessions with `xproxy_socks` are rejected.
+Only TCP is supported with SOCKS.
 
 ```nginx
 stream {
@@ -117,3 +117,19 @@ stream {
 `xproxy_pass` must use an explicit `host:port`. Named upstreams are not supported together with SOCKS, because the SOCKS target would be ambiguous.
 
 `xproxy_ssl` and `xproxy_protocol` are applied after the SOCKS tunnel is established.
+
+## Testing
+
+The repository includes a self-contained SOCKS integration suite:
+
+```bash
+python3 tests/socks/run.py \
+    --nginx /path/to/nginx \
+    --http-module /path/to/ngx_http_xproxy_module.so \
+    --stream-module /path/to/ngx_stream_xproxy_module.so \
+    --label normal \
+    --mode all
+```
+
+See `tests/socks/README.md` for normal and ASan build commands, modes, soak
+duration and report locations.
