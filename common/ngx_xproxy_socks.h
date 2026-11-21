@@ -406,6 +406,7 @@ ngx_xproxy_socks_build_connect(ngx_xproxy_socks_conn_t *s, ngx_pool_t *pool)
     u_char                  *p, *ip;
     size_t                   len;
     u_short                  port;
+    ngx_str_t                host;
     ngx_addr_t               addr;
     ngx_int_t                rc;
     struct sockaddr_in      *sin;
@@ -413,7 +414,14 @@ ngx_xproxy_socks_build_connect(ngx_xproxy_socks_conn_t *s, ngx_pool_t *pool)
     struct sockaddr_in6     *sin6;
 #endif
 
-    if (s->target_host.len == 0 || s->target_host.len > 0xff) {
+    host = s->target_host;
+
+    if (host.len > 2 && host.data[0] == '[' && host.data[host.len - 1] == ']') {
+        host.data++;
+        host.len -= 2;
+    }
+
+    if (host.len == 0 || host.len > 0xff) {
         s->state = NGX_XPROXY_SOCKS_STATE_ERROR;
         ngx_str_set(&s->error, "invalid socks target host");
         return NGX_ERROR;
@@ -427,8 +435,7 @@ ngx_xproxy_socks_build_connect(ngx_xproxy_socks_conn_t *s, ngx_pool_t *pool)
 
     ngx_memzero(&addr, sizeof(ngx_addr_t));
 
-    rc = ngx_parse_addr(pool, &addr, s->target_host.data,
-                        s->target_host.len);
+    rc = ngx_parse_addr(pool, &addr, host.data, host.len);
 
     if (rc == NGX_ERROR) {
         s->state = NGX_XPROXY_SOCKS_STATE_ERROR;
@@ -482,8 +489,8 @@ ngx_xproxy_socks_build_connect(ngx_xproxy_socks_conn_t *s, ngx_pool_t *pool)
         *p++ = '\0';
 
         if (rc == NGX_DECLINED) {
-            ngx_memcpy(p, s->target_host.data, s->target_host.len);
-            p += s->target_host.len;
+            ngx_memcpy(p, host.data, host.len);
+            p += host.len;
             *p++ = '\0';
         }
 
@@ -538,9 +545,9 @@ ngx_xproxy_socks_build_connect(ngx_xproxy_socks_conn_t *s, ngx_pool_t *pool)
         }
 
         *p++ = NGX_XPROXY_SOCKS_ATYP_DOMAIN;
-        *p++ = (u_char) s->target_host.len;
-        ngx_memcpy(p, s->target_host.data, s->target_host.len);
-        p += s->target_host.len;
+        *p++ = (u_char) host.len;
+        ngx_memcpy(p, host.data, host.len);
+        p += host.len;
     }
 
     port = htons(s->target_port);
